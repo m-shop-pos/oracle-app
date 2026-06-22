@@ -5,6 +5,7 @@ import pandas as pd
 import re
 from datetime import datetime
 import json
+import sqlite3
 
 # 1. เชื่อมต่อฐานข้อมูล Firebase Firestore
 if not firebase_admin._apps:
