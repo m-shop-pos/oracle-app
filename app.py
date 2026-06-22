@@ -10,7 +10,7 @@ import json
 if not firebase_admin._apps:
     # เช็กว่ากำลังรันบน Cloud หรือ Local
     if "firebase" in st.secrets:
-        key_dict = json.loads(st.secrets["firebase"])
+        key_dict = dict(st.secrets["firebase"])
         cred = credentials.Certificate(key_dict)
     else:
         cred = credentials.Certificate('firebase-key.json')
@@ -255,10 +255,10 @@ if st.session_state.active_tab == "📊 Market Data":
                         
         if selected_view_date == "ดูทั้งหมด":
             docs = db.collection('results').where('web_name', '==', web_name).stream()
-    data = [d.to_dict() for d in docs]
-    df = pd.DataFrame(data)
-    if not df.empty:
-        df = df.sort_values(by=['date', 'round_number'], ascending=[False, False])
+            data = [d.to_dict() for d in docs]
+            df = pd.DataFrame(data)
+            if not df.empty:
+                df = df.sort_values(by=['date', 'round_number'], ascending=[False, False])
         elif selected_view_date.startswith("ดูเฉพาะเดือน:"):
             month = selected_view_date.replace("ดูเฉพาะเดือน: ", "")
             docs = db.collection('results').where('web_name', '==', web_name).stream()
