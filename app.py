@@ -1,6 +1,7 @@
 import streamlit as st
 import firebase_admin
 from firebase_admin import credentials, firestore
+import sqlite3
 import pandas as pd
 import re
 from datetime import datetime
@@ -8,8 +9,14 @@ import json
 
 # 1. เชื่อมต่อฐานข้อมูล Firebase Firestore
 if not firebase_admin._apps:
-    # เช็กว่ากำลังรันบน Cloud หรือ Local
-    if "firebase" in st.secrets:
+    has_secrets = False
+    try:
+        if "firebase" in st.secrets:
+            has_secrets = True
+    except Exception:
+        pass
+        
+    if has_secrets:
         key_dict = dict(st.secrets["firebase"])
         cred = credentials.Certificate(key_dict)
     else:
@@ -31,22 +38,34 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 2. การจัดการฐานข้อมูล (Firebase)
+# 2. การจัดการฐานข้อมูล (SQLite)
 def init_db():
-    # Firebase collections are created automatically, but we initialize algo_stats if empty
+    conn = sqlite3.connect('oracle.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS results (
+            web_name TEXT,
+            date DATE,
+            round_number INTEGER,
+            top_3 TEXT,
+            bottom_2 TEXT,
+            PRIMARY KEY (web_name, date, round_number)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS algo_stats (
+            algorithm TEXT PRIMARY KEY,
+            wins INTEGER,
+            losses INTEGER,
+            score REAL
+        )
+    """)
     algos = ["สูตรเลขไหล (Hot Pick)", "สูตรล็อกตามกระแส (Markov)", "สูตรเลขตาม (Cold Chasing)"]
-    stats_ref = db.collection('algo_stats')
     for algo in algos:
-        doc = stats_ref.document(algo).get()
-        if not doc.exists:
-            stats_ref.document(algo).set({
-                'algorithm': algo,
-                'wins': 0,
-                'losses': 0,
-                'score': 0.0
-            })
+        c.execute('INSERT OR IGNORE INTO algo_stats (algorithm, wins, losses, score) VALUES (?, 0, 0, 0.0)', (algo,))
+    conn.commit()
+    conn.close()
 
-# เรียกใช้เพื่อเตรียมฐานข้อมูล
 try:
     init_db()
 except:
@@ -55,14 +74,14 @@ except:
 # ฟังก์ชันบันทึกผลลัพธ์
 def save_result(web_name, date, round_number, top_3, bottom_2):
     try:
-        doc_ref = db.collection('results').document(f"{web_name}_{date}_{round_number}")
-        doc_ref.set({
-            'web_name': web_name,
-            'date': date,
-            'round_number': int(round_number),
-            'top_3': str(top_3),
-            'bottom_2': str(bottom_2)
-        })
+        conn = sqlite3.connect('oracle.db')
+        c = conn.cursor()
+        c.execute("""
+            INSERT OR REPLACE INTO results (web_name, date, round_number, top_3, bottom_2) 
+            VALUES (?, ?, ?, ?, ?)
+        """, (web_name, date, round_number, top_3, bottom_2))
+        conn.commit()
+        conn.close()
         return True
     except Exception as e:
         st.error(f"เกิดข้อผิดพลาดในการบันทึกข้อมูล: {e}")
@@ -73,21 +92,24 @@ def check_batch_duplicate(web_name, target_date, matches):
     if len(matches) < 3:
         return None
     try:
-        results = db.collection('results').where('web_name', '==', web_name).stream()
-        all_data = [doc.to_dict() for doc in results]
-        other_dates = set([d['date'] for d in all_data if d.get('date') != target_date])
+        conn = sqlite3.connect('oracle.db')
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT date FROM results WHERE web_name = ? AND date != ?", (web_name, target_date))
+        other_dates = [row[0] for row in c.fetchall()]
+        
         duplicate_date = None
         for d in other_dates:
             match_count = 0
-            day_data = [item for item in all_data if item.get('date') == d]
             for m in matches:
-                for day_item in day_data:
-                    if str(day_item.get('round_number')) == str(m['round_num']) and day_item.get('top_3') == m['top_3'] and day_item.get('bottom_2') == m['bot_2']:
-                        match_count += 1
-                        break
-            if match_count >= 3:
+                c.execute("SELECT 1 FROM results WHERE web_name = ? AND date = ? AND round_number = ? AND top_3 = ? AND bottom_2 = ?", 
+                          (web_name, d, int(m['round_num']), str(m['top_3']).zfill(3), str(m['bot_2']).zfill(2)))
+                if c.fetchone():
+                    match_count += 1
+            if match_count == len(matches):
                 duplicate_date = d
                 break
+                
+        conn.close()
         return duplicate_date
     except Exception as e:
         return None
@@ -197,8 +219,10 @@ if st.session_state.active_tab == "✍️ Data Input":
 if st.session_state.active_tab == "📊 Market Data":
     st.markdown("#### Historical Market Data")
     
-    # ดึงวันที่ทั้งหมดที่มีในระบบสำหรับเว็บนี้มาทำ Dropdown (ใช้ TRIM เพื่อกันปัญหาช่องว่าง)
+    # ดึงวันที่ทั้งหมดที่มีในระบบสำหรับเว็บนี้มาทำ Dropdown
+    conn = sqlite3.connect('oracle.db')
     dates_df = pd.read_sql_query('SELECT DISTINCT TRIM(date) as date FROM results WHERE web_name = ? ORDER BY date DESC', conn, params=(web_name,))
+    conn.close()
     
     if dates_df.empty:
         st.info(f"ยังไม่มีข้อมูลประวัติสำหรับห้อง '{web_name}'")
@@ -222,34 +246,26 @@ if st.session_state.active_tab == "📊 Market Data":
             if selected_view_date != "ดูทั้งหมด" and not selected_view_date.startswith("ดูเฉพาะเดือน:"):
                 if st.button(f"🗑️ ล้างข้อมูลของวันที่ {selected_view_date}", help="ใช้สำหรับลบข้อมูลของวันนี้ทิ้งทั้งหมด (กรณีบันทึกผิด)"):
                     try:
-                        docs = db.collection('results').where('web_name', '==', web_name).where('date', '==', selected_view_date).stream()
-                        for doc in docs:
-                            doc.reference.delete()
+                        conn = sqlite3.connect('oracle.db')
+                        c = conn.cursor()
+                        c.execute("DELETE FROM results WHERE web_name = ? AND date = ?", (web_name, selected_view_date))
+                        conn.commit()
+                        conn.close()
                         st.success(f"✅ ล้างข้อมูลของวันที่ {selected_view_date} เรียบร้อยแล้ว")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error deleting data: {e}")
                         
+        conn = sqlite3.connect('oracle.db')
         if selected_view_date == "ดูทั้งหมด":
-            docs = db.collection('results').where('web_name', '==', web_name).stream()
-            data = [d.to_dict() for d in docs]
-            df = pd.DataFrame(data)
-            if not df.empty:
-                df = df.sort_values(by=['date', 'round_number'], ascending=[False, False])
+            df = pd.read_sql_query('SELECT date, round_number, top_3, bottom_2 FROM results WHERE web_name = ? ORDER BY date DESC, round_number DESC', conn, params=(web_name,))
         elif selected_view_date.startswith("ดูเฉพาะเดือน:"):
             month = selected_view_date.replace("ดูเฉพาะเดือน: ", "")
-            docs = db.collection('results').where('web_name', '==', web_name).stream()
-            data = [d.to_dict() for d in docs if d.to_dict().get('date', '').startswith(month)]
-            df = pd.DataFrame(data)
-            if not df.empty:
-                df = df.sort_values(by=['date', 'round_number'], ascending=[False, False])
+            df = pd.read_sql_query('SELECT date, round_number, top_3, bottom_2 FROM results WHERE web_name = ? AND date LIKE ? ORDER BY date DESC, round_number DESC', conn, params=(web_name, f"{month}-%"))
         else:
             # ถ้าเลือกเป็นวันเดียว ให้เรียงจากรอบน้อยไปมาก (ASC) จะได้ดูง่ายขึ้น
-            docs = db.collection('results').where('web_name', '==', web_name).where('date', '==', selected_view_date).stream()
-            data = [d.to_dict() for d in docs]
-            df = pd.DataFrame(data)
-            if not df.empty:
-                df = df.sort_values(by=['round_number'], ascending=[True])
+            df = pd.read_sql_query('SELECT date, round_number, top_3, bottom_2 FROM results WHERE web_name = ? AND date = ? ORDER BY round_number ASC', conn, params=(web_name, selected_view_date))
+        conn.close()
             
         # เปลี่ยนชื่อคอลัมน์ให้แสดงผลสวยงาม
         display_df = df.rename(columns={'date': 'วันที่', 'round_number': 'รอบ', 'top_3': '3ตัวบน', 'bottom_2': '2ตัวล่าง'})
@@ -616,12 +632,9 @@ if st.session_state.get('check_win_round') is not None:
     act_3 = st.session_state.check_win_top3
     act_2 = st.session_state.check_win_bot2
     
-    # For a single day check, we just fetch all and filter in Python
-    docs = db.collection('results').where('web_name', '==', web_name).stream()
-    data = [d.to_dict() for d in docs if d.to_dict().get('round_number', 9999) < r_num]
-    past_df = pd.DataFrame(data)
-    if not past_df.empty:
-        past_df = past_df.sort_values(by=['date', 'round_number'], ascending=[False, False]).head(50)
+    conn = sqlite3.connect('oracle.db')
+    past_df = pd.read_sql_query('SELECT date, round_number, top_3, bottom_2 FROM results WHERE web_name = ? AND round_number < ? ORDER BY date DESC, round_number DESC LIMIT 50', conn, params=(web_name, r_num))
+    conn.close()
     
     if not past_df.empty:
         p3, p2, prun, pwin = get_predictions(past_df)
