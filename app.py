@@ -5,7 +5,6 @@ import pandas as pd
 import re
 from datetime import datetime
 import json
-import sqlite3
 
 # 1. เชื่อมต่อฐานข้อมูล Firebase Firestore
 if not firebase_admin._apps:
@@ -32,53 +31,38 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# 2. การจัดการฐานข้อมูล (SQLite)
+# 2. การจัดการฐานข้อมูล (Firebase)
 def init_db():
-    conn = sqlite3.connect('oracle.db', check_same_thread=False)
-    c = conn.cursor()
-    # สร้างตาราง results
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS results (
-            web_name TEXT,
-            date DATE,
-            round_number INTEGER,
-            top_3 TEXT,
-            bottom_2 TEXT,
-            PRIMARY KEY (web_name, date, round_number)
-        )
-    ''')
-    # สร้างตาราง algo_stats
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS algo_stats (
-            algorithm TEXT PRIMARY KEY,
-            wins INTEGER,
-            losses INTEGER,
-            score REAL
-        )
-    ''')
-    
-    # กำหนดค่าเริ่มต้นของสูตร
+    # Firebase collections are created automatically, but we initialize algo_stats if empty
     algos = ["สูตรเลขไหล (Hot Pick)", "สูตรล็อกตามกระแส (Markov)", "สูตรเลขตาม (Cold Chasing)"]
+    stats_ref = db.collection('algo_stats')
     for algo in algos:
-        c.execute('INSERT OR IGNORE INTO algo_stats (algorithm, wins, losses, score) VALUES (?, 0, 0, 0.0)', (algo,))
-    
-    conn.commit()
-    conn.close()
+        doc = stats_ref.document(algo).get()
+        if not doc.exists:
+            stats_ref.document(algo).set({
+                'algorithm': algo,
+                'wins': 0,
+                'losses': 0,
+                'score': 0.0
+            })
 
 # เรียกใช้เพื่อเตรียมฐานข้อมูล
-init_db()
+try:
+    init_db()
+except:
+    pass
 
 # ฟังก์ชันบันทึกผลลัพธ์
 def save_result(web_name, date, round_number, top_3, bottom_2):
     try:
-        conn = sqlite3.connect('oracle.db')
-        c = conn.cursor()
-        c.execute('''
-            INSERT OR REPLACE INTO results (web_name, date, round_number, top_3, bottom_2) 
-            VALUES (?, ?, ?, ?, ?)
-        ''', (web_name, date, round_number, top_3, bottom_2))
-        conn.commit()
-        conn.close()
+        doc_ref = db.collection('results').document(f"{web_name}_{date}_{round_number}")
+        doc_ref.set({
+            'web_name': web_name,
+            'date': date,
+            'round_number': int(round_number),
+            'top_3': str(top_3),
+            'bottom_2': str(bottom_2)
+        })
         return True
     except Exception as e:
         st.error(f"เกิดข้อผิดพลาดในการบันทึกข้อมูล: {e}")
@@ -89,31 +73,24 @@ def check_batch_duplicate(web_name, target_date, matches):
     if len(matches) < 3:
         return None
     try:
-        conn = sqlite3.connect('oracle.db')
-        c = conn.cursor()
-        c.execute("SELECT DISTINCT date FROM results WHERE web_name = ? AND date != ?", (web_name, target_date))
-        other_dates = [row[0] for row in c.fetchall()]
-        
+        results = db.collection('results').where('web_name', '==', web_name).stream()
+        all_data = [doc.to_dict() for doc in results]
+        other_dates = set([d['date'] for d in all_data if d.get('date') != target_date])
         duplicate_date = None
         for d in other_dates:
             match_count = 0
+            day_data = [item for item in all_data if item.get('date') == d]
             for m in matches:
-                c.execute("SELECT 1 FROM results WHERE web_name = ? AND date = ? AND round_number = ? AND top_3 = ? AND bottom_2 = ?", 
-                          (web_name, d, int(m['round_num']), str(m['top_3']).zfill(3), str(m['bot_2']).zfill(2)))
-                if c.fetchone():
-                    match_count += 1
-                else:
-                    break
-            
-            if match_count == len(matches):
+                for day_item in day_data:
+                    if str(day_item.get('round_number')) == str(m['round_num']) and day_item.get('top_3') == m['top_3'] and day_item.get('bottom_2') == m['bot_2']:
+                        match_count += 1
+                        break
+            if match_count >= 3:
                 duplicate_date = d
                 break
-                
-        conn.close()
         return duplicate_date
     except Exception as e:
         return None
-
 # 3. แถบข้าง (Sidebar)
 st.sidebar.title("🔮 Oracle Settings")
 st.sidebar.markdown("---")
@@ -215,7 +192,6 @@ if st.session_state.active_tab == "✍️ Data Input":
             st.warning("⚠️ กรุณาวางข้อความก่อนกดบันทึก")
 
 # Connection หลักสำหรับ แท็บ 2 และ 3
-conn = sqlite3.connect('oracle.db')
 
 # --- แท็บ 2: ประวัติ & สถิติรวม ---
 if st.session_state.active_tab == "📊 Market Data":
